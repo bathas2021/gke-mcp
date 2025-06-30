@@ -19,7 +19,7 @@ warnings.filterwarnings(
 
 try:
     # Import the official MCP SDK with FastMCP
-    from mcp.server.fastmcp import FastMCP
+    from fastmcp import FastMCP
 except ImportError:
     logging.error("MCP SDK not found. Installing...")
     import subprocess
