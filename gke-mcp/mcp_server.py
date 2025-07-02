@@ -20,6 +20,8 @@ warnings.filterwarnings(
 try:
     # Import the official MCP SDK with FastMCP
     from fastmcp import FastMCP
+
+
 except ImportError:
     logging.error("MCP SDK not found. Installing...")
     import subprocess
@@ -28,7 +30,7 @@ except ImportError:
             sys.executable, "-m", "pip", "install", 
             "mcp>=1.5.0"
         ])
-        from mcp.server.fastmcp import FastMCP
+        from fastmcp import FastMCP
     except Exception as e:
         logging.error(f"Failed to install MCP SDK: {e}")
         raise
@@ -42,12 +44,14 @@ logger = logging.getLogger("mcp-server")
 class MCPServer:
     """MCP server implementation."""
 
-    def __init__(self, name: str, port: int):
+    def __init__(self, name: str, port: int, path: str):
         """Initialize the MCP server."""
         self.name = name
         self.port = port
+        self.path = path
+        print(path)
         # Create a new server instance using the FastMCP API
-        self.server = FastMCP(name=name, port=port, host="127.0.0.1")
+        self.server = FastMCP(name=name, port=port, host="127.0.0.1",json_response=True)
         # Check for required dependencies
         self.dependencies_available = self._check_dependencies()
         if not self.dependencies_available:
@@ -328,83 +332,93 @@ class MCPServer:
 
         @self.server.tool()
         def install_helm_chart(name: str, chart: str, namespace: str, repo: str = None, values: dict = None) -> Dict[str, Any]:
-            """Install a Helm chart."""
-            if not self._check_helm_availability():
-                return {"success": False, "error": "Helm is not available on this system"}
+            """Install a Helm chart. Automatically installs Helm if missing."""
             
+            # Check and install Helm if needed
+            if not self._check_helm_availability():
+                logger.warning("Helm not found. Attempting to install Helm...")
+                if not _install_helm():
+                    return {"success": False, "error": "Helm is not installed and automatic installation failed."}
+
             try:
-                import subprocess, tempfile, yaml, os
-                
-                # Handle repo addition as a separate step if provided
+                # Add repo if provided
                 if repo:
+                    repo_parts = repo.split('=')
+                    if len(repo_parts) != 2:
+                        return {"success": False, "error": "Repository format should be 'repo_name=repo_url'"}
+                    
+                    repo_name, repo_url = repo_parts
                     try:
-                        # Add the repository (assumed format: "repo_name=repo_url")
-                        repo_parts = repo.split('=')
-                        if len(repo_parts) != 2:
-                            return {"success": False, "error": "Repository format should be 'repo_name=repo_url'"}
-                        
-                        repo_name, repo_url = repo_parts
-                        repo_add_cmd = ["helm", "repo", "add", repo_name, repo_url]
-                        logger.debug(f"Running command: {' '.join(repo_add_cmd)}")
-                        subprocess.check_output(repo_add_cmd, stderr=subprocess.PIPE, text=True)
-                        
-                        # Update repositories
-                        repo_update_cmd = ["helm", "repo", "update"]
-                        logger.debug(f"Running command: {' '.join(repo_update_cmd)}")
-                        subprocess.check_output(repo_update_cmd, stderr=subprocess.PIPE, text=True)
-                        
-                        # Use the chart with repo prefix if needed
+                        subprocess.check_output(["helm", "repo", "add", repo_name, repo_url], stderr=subprocess.PIPE, text=True)
+                        subprocess.check_output(["helm", "repo", "update"], stderr=subprocess.PIPE, text=True)
                         if '/' not in chart:
                             chart = f"{repo_name}/{chart}"
                     except subprocess.CalledProcessError as e:
-                        logger.error(f"Error adding Helm repo: {e.stderr if hasattr(e, 'stderr') else str(e)}")
-                        return {"success": False, "error": f"Failed to add Helm repo: {e.stderr if hasattr(e, 'stderr') else str(e)}"}
-                
-                # Prepare the install command
-                cmd = ["helm", "install", name, chart, "-n", namespace]
-                
-                # Create namespace if it doesn't exist
+                        return {"success": False, "error": f"Failed to add Helm repo: {e.stderr or str(e)}"}
+
+                # Ensure namespace exists
                 try:
-                    ns_cmd = ["kubectl", "get", "namespace", namespace]
-                    subprocess.check_output(ns_cmd, stderr=subprocess.PIPE, text=True)
+                    subprocess.check_output(["kubectl", "get", "namespace", namespace], stderr=subprocess.PIPE, text=True)
                 except subprocess.CalledProcessError:
-                    logger.info(f"Namespace {namespace} not found, creating it")
-                    create_ns_cmd = ["kubectl", "create", "namespace", namespace]
                     try:
-                        subprocess.check_output(create_ns_cmd, stderr=subprocess.PIPE, text=True)
+                        subprocess.check_output(["kubectl", "create", "namespace", namespace], stderr=subprocess.PIPE, text=True)
                     except subprocess.CalledProcessError as e:
-                        logger.error(f"Error creating namespace: {e.stderr if hasattr(e, 'stderr') else str(e)}")
-                        return {"success": False, "error": f"Failed to create namespace: {e.stderr if hasattr(e, 'stderr') else str(e)}"}
-                
-                # Handle values file if provided
+                        return {"success": False, "error": f"Failed to create namespace: {e.stderr or str(e)}"}
+
+                # Prepare values.yaml if needed
+                cmd = ["helm", "install", name, chart, "-n", namespace]
                 values_file = None
-                try:
-                    if values:
-                        with tempfile.NamedTemporaryFile("w", delete=False) as f:
-                            yaml.dump(values, f)
-                            values_file = f.name
-                        cmd += ["-f", values_file]
-                    
-                    # Execute the install command
-                    logger.debug(f"Running command: {' '.join(cmd)}")
-                    result = subprocess.check_output(cmd, stderr=subprocess.PIPE, text=True)
-                    
-                    return {
-                        "success": True, 
-                        "message": f"Helm chart {chart} installed as {name} in {namespace}",
-                        "details": result
-                    }
-                except subprocess.CalledProcessError as e:
-                    error_msg = e.stderr if hasattr(e, 'stderr') else str(e)
-                    logger.error(f"Error installing Helm chart: {error_msg}")
-                    return {"success": False, "error": f"Failed to install Helm chart: {error_msg}"}
-                finally:
-                    # Clean up the temporary values file
-                    if values_file and os.path.exists(values_file):
-                        os.unlink(values_file)
+                if values:
+                    with tempfile.NamedTemporaryFile("w", delete=False) as f:
+                        yaml.dump(values, f)
+                        values_file = f.name
+                    cmd += ["-f", values_file]
+
+                # Run Helm install
+                result = subprocess.check_output(cmd, stderr=subprocess.PIPE, text=True)
+
+                return {
+                    "success": True,
+                    "message": f"Helm chart {chart} installed as {name} in {namespace}",
+                    "details": result
+                }
+
+            except subprocess.CalledProcessError as e:
+                return {"success": False, "error": f"Failed to install Helm chart: {e.stderr or str(e)}"}
             except Exception as e:
-                logger.error(f"Unexpected error installing Helm chart: {str(e)}")
                 return {"success": False, "error": f"Unexpected error: {str(e)}"}
+            finally:
+                if values_file and os.path.exists(values_file):
+                    os.unlink(values_file)
+        @self.server.tool()
+        # Helper to install Helm
+        def _install_helm() -> bool:
+            try:
+                arch = platform.machine()
+                if arch == "x86_64":
+                    arch = "amd64"
+                elif arch == "aarch64":
+                    arch = "arm64"
+                system = platform.system().lower()
+
+                helm_version = "v3.14.4"
+                helm_url = f"https://get.helm.sh/helm-{helm_version}-{system}-{arch}.tar.gz"
+                logger.info(f"Downloading Helm from {helm_url}")
+
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    archive_path = os.path.join(tmpdir, "helm.tar.gz")
+                    subprocess.check_call(["curl", "-fsSL", "-o", archive_path, helm_url])
+                    subprocess.check_call(["tar", "-zxvf", archive_path, "-C", tmpdir])
+                    helm_bin = os.path.join(tmpdir, system + "-" + arch, "helm")
+                    shutil.copy(helm_bin, "/usr/local/bin/helm")
+                    os.chmod("/usr/local/bin/helm", 0o755)
+
+                logger.info("Helm installed successfully.")
+                return True
+
+            except Exception as e:
+                logger.error(f"Helm installation failed: {str(e)}")
+                return False
 
         @self.server.tool()
         def upgrade_helm_chart(name: str, chart: str, namespace: str, repo: str = None, values: dict = None) -> Dict[str, Any]:
@@ -812,49 +826,82 @@ class MCPServer:
                 logger.error(f"Error getting deployments: {e}")
                 return {"success": False, "error": str(e)}
 
+
         @self.server.tool()
-        def create_deployment(name: str, image: str, replicas: int, namespace: str = "default") -> Dict[str, Any]:
-            """Create a new deployment."""
+        def create_deployment(
+            name: str,
+            replicas: int,
+            namespace: str = "default",
+            containers: List[Dict[str, Any]] = None,
+            init_containers: Optional[List[Dict[str, Any]]] = None,
+            volumes: Optional[List[Dict[str, Any]]] = None,
+            node_selector: Optional[Dict[str, str]] = None,
+            pod_labels: Optional[Dict[str, str]] = None
+        ) -> Dict[str, Any]:
+            """Create a deployment with multi-container support."""
             try:
                 from kubernetes import client, config
                 config.load_kube_config()
                 apps_v1 = client.AppsV1Api()
-                
+
+                # Build container objects
+                container_objs = []
+                for c in containers or []:
+                    container_objs.append(client.V1Container(
+                        name=c["name"],
+                        image=c["image"],
+                        command=c.get("command"),
+                        args=c.get("args"),
+                        env=[client.V1EnvVar(name=env["name"], value=env["value"])
+                            for env in c.get("env", [])],
+                        volume_mounts=[client.V1VolumeMount(**vm) for vm in c.get("volume_mounts", [])],
+                        resources=client.V1ResourceRequirements(**c["resources"]) if "resources" in c else None
+                    ))
+
+                # Build init containers
+                init_container_objs = []
+                for ic in init_containers or []:
+                    init_container_objs.append(client.V1Container(
+                        name=ic["name"],
+                        image=ic["image"],
+                        command=ic.get("command"),
+                        args=ic.get("args"),
+                        env=[client.V1EnvVar(name=e["name"], value=e["value"]) for e in ic.get("env", [])],
+                        volume_mounts=[client.V1VolumeMount(**vm) for vm in ic.get("volume_mounts", [])]
+                    ))
+
+                pod_spec = client.V1PodSpec(
+                    containers=container_objs,
+                    init_containers=init_container_objs or None,
+                    volumes=[client.V1Volume(**v) for v in (volumes or [])],
+                    node_selector=node_selector
+                )
+
+                labels = {"app": name}
+                if pod_labels:
+                    labels.update(pod_labels)
+
                 deployment = client.V1Deployment(
                     metadata=client.V1ObjectMeta(name=name),
                     spec=client.V1DeploymentSpec(
                         replicas=replicas,
-                        selector=client.V1LabelSelector(
-                            match_labels={"app": name}
-                        ),
+                        selector=client.V1LabelSelector(match_labels={"app": name}),
                         template=client.V1PodTemplateSpec(
-                            metadata=client.V1ObjectMeta(
-                                labels={"app": name}
-                            ),
-                            spec=client.V1PodSpec(
-                                containers=[
-                                    client.V1Container(
-                                        name=name,
-                                        image=image
-                                    )
-                                ]
-                            )
+                            metadata=client.V1ObjectMeta(labels=labels),
+                            spec=pod_spec
                         )
                     )
                 )
-                
-                apps_v1.create_namespaced_deployment(
-                    body=deployment,
-                    namespace=namespace
-                )
-                
-                return {
-                    "success": True,
-                    "message": f"Deployment {name} created successfully"
-                }
+
+                apps_v1.create_namespaced_deployment(body=deployment, namespace=namespace)
+                return {"success": True, "message": f"Deployment {name} created successfully"}
+
             except Exception as e:
+                import logging
+                logger = logging.getLogger("create_deployment")
                 logger.error(f"Error creating deployment: {e}")
                 return {"success": False, "error": str(e)}
+                
 
         @self.server.tool()
         def delete_resource(resource_type: str, name: str, namespace: str = "default") -> Dict[str, Any]:
@@ -965,7 +1012,88 @@ class MCPServer:
             except Exception as e:
                 logger.error(f"Error scaling deployment: {e}")
                 return {"success": False, "error": str(e)}
-    
+        @self.server.tool()
+        def create_persistent_volume(
+            name: str,
+            storage_class: str,
+            capacity: str,
+            access_modes: List[str],
+            host_path: str = None,
+            nfs_path: str = None,
+            nfs_server: str = None
+        ) -> Dict[str, Any]:
+            """
+            Create a PersistentVolume (PV).
+            Supports hostPath or NFS volume source.
+            """
+            try:
+                from kubernetes import client, config
+                config.load_kube_config()
+                v1 = client.CoreV1Api()
+
+                volume_source = None
+                if host_path:
+                    volume_source = client.V1HostPathVolumeSource(path=host_path)
+                elif nfs_path and nfs_server:
+                    volume_source = client.V1NFSVolumeSource(path=nfs_path, server=nfs_server)
+                else:
+                    return {"success": False, "error": "Either host_path or (nfs_path + nfs_server) must be provided"}
+
+                pv = client.V1PersistentVolume(
+                    metadata=client.V1ObjectMeta(name=name),
+                    spec=client.V1PersistentVolumeSpec(
+                        capacity={"storage": capacity},
+                        access_modes=access_modes,
+                        storage_class_name=storage_class,
+                        persistent_volume_reclaim_policy="Retain",
+                        host_path=volume_source if host_path else None,
+                        nfs=volume_source if nfs_path else None
+                    )
+                )
+
+                v1.create_persistent_volume(pv)
+                return {"success": True, "message": f"PV {name} created successfully"}
+
+            except Exception as e:
+                import logging
+                logging.getLogger("create_pv").error(str(e))
+                return {"success": False, "error": str(e)}
+            
+        @self.server.tool()    
+        def create_persistent_volume_claim(
+            name: str,
+            namespace: str,
+            storage_class: str,
+            access_modes: List[str],
+            storage_request: str
+        ) -> Dict[str, Any]:
+            """
+            Create a PersistentVolumeClaim (PVC) in the specified namespace.
+            """
+            try:
+                from kubernetes import client, config
+                config.load_kube_config()
+                v1 = client.CoreV1Api()
+
+                pvc = client.V1PersistentVolumeClaim(
+                    metadata=client.V1ObjectMeta(name=name),
+                    spec=client.V1PersistentVolumeClaimSpec(
+                        access_modes=access_modes,
+                        storage_class_name=storage_class,
+                        resources=client.V1ResourceRequirements(
+                            requests={"storage": storage_request}
+                        )
+                    )
+                )
+
+                v1.create_namespaced_persistent_volume_claim(namespace=namespace, body=pvc)
+                return {"success": True, "message": f"PVC {name} created successfully in {namespace}"}
+
+            except Exception as e:
+                import logging
+                logging.getLogger("create_pvc").error(str(e))
+                return {"success": False, "error": str(e)}
+
     def _check_dependencies(self) -> bool:
         """Check for required command-line tools."""
         all_available = True
@@ -1027,6 +1155,13 @@ class MCPServer:
         logger.info(f"Starting MCP server with SSE transport on port {port}")
         # await self.server.run_sse_async(port=port)
         await self.server.run_sse_async()
+
+    async def serve_http(self, port: int, path: str):
+        """Serve the MCP server over http transport."""
+        logger.info(f"Starting MCP server with http transport on port {port} and path {path}")
+        # await self.server.run_sse_async(port=port)
+        await self.server.run_http_async()
+            
         
 if __name__ == "__main__":
     import asyncio
@@ -1039,7 +1174,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--transport",
         type=str,
-        choices=["stdio", "sse"],
+        choices=["stdio", "sse", "http"],
         default="stdio",
         help="Communication transport to use (stdio or sse). Default: stdio.",
     )
@@ -1049,13 +1184,20 @@ if __name__ == "__main__":
         default=8080,
         help="Port to use for SSE transport. Default: 8080.",
     )
+    parser.add_argument(
+        "--path",
+        type=str,
+        default="/mcp",
+        help="path to use for http transport. Default: /mcp.",
+    )     
     args = parser.parse_args()
 
-    server_name = "kubectl_mcp_server"
+    server_name = "gke_mcp_server"
     # Ensure MCPServer class is defined above this block
     mcp_server = MCPServer(name=server_name) 
     # Ensure logger is defined at the module level
-    # logger = logging.getLogger(__name__) # Or however it's set up
+    # logger = logging.getLogger(__name__) # Or 
+    # however it's set up
 
     loop = asyncio.get_event_loop()
     try:
@@ -1065,6 +1207,9 @@ if __name__ == "__main__":
         elif args.transport == "sse":
             logger.info(f"Starting {server_name} with SSE transport on port {args.port}.")
             loop.run_until_complete(mcp_server.serve_sse(port=args.port))
+        elif args.transport == "http":
+             logger.info(f"Starting {server_name} with http transport on port {args.port} and path {args.path}.")
+             loop.run_until_complete(mcp_server.serve_http(port=args.port, path=args.path))
     except KeyboardInterrupt:
         logger.info("Server shutdown requested by user.")
     except Exception as e:
