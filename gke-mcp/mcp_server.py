@@ -1,7 +1,4 @@
 #!/usr/bin/env python3
-"""
-MCP server implementation for kubectl-mcp-tool.
-"""
 
 import json
 import sys
@@ -836,9 +833,12 @@ class MCPServer:
             init_containers: Optional[List[Dict[str, Any]]] = None,
             volumes: Optional[List[Dict[str, Any]]] = None,
             node_selector: Optional[Dict[str, str]] = None,
-            pod_labels: Optional[Dict[str, str]] = None
+            pod_labels: Optional[Dict[str, str]] = None,
+            tolerations: Optional[List[Dict[str, Any]]] = None,
+            affinity: Optional[Dict[str, Any]] = None,
+            pod_security_context: Optional[Dict[str, Any]] = None
         ) -> Dict[str, Any]:
-            """Create a deployment with multi-container support."""
+            """Create a deployment with extended capabilities."""
             try:
                 from kubernetes import client, config
                 config.load_kube_config()
@@ -847,18 +847,26 @@ class MCPServer:
                 # Build container objects
                 container_objs = []
                 for c in containers or []:
+                    liveness_probe = client.V1Probe(**c["liveness_probe"]) if "liveness_probe" in c else None
+                    readiness_probe = client.V1Probe(**c["readiness_probe"]) if "readiness_probe" in c else None
+                    env_vars = [
+                        client.V1EnvVar(name=env["name"], value=env.get("value"), value_from=client.V1EnvVarSource(**env["value_from"]) if "value_from" in env else None)
+                        for env in c.get("env", [])
+                    ]
                     container_objs.append(client.V1Container(
                         name=c["name"],
                         image=c["image"],
                         command=c.get("command"),
                         args=c.get("args"),
-                        env=[client.V1EnvVar(name=env["name"], value=env["value"])
-                            for env in c.get("env", [])],
+                        env=env_vars,
                         volume_mounts=[client.V1VolumeMount(**vm) for vm in c.get("volume_mounts", [])],
-                        resources=client.V1ResourceRequirements(**c["resources"]) if "resources" in c else None
+                        resources=client.V1ResourceRequirements(**c["resources"]) if "resources" in c else None,
+                        liveness_probe=liveness_probe,
+                        readiness_probe=readiness_probe,
+                        security_context=client.V1SecurityContext(**c["security_context"]) if "security_context" in c else None
                     ))
 
-                # Build init containers
+                # Init containers
                 init_container_objs = []
                 for ic in init_containers or []:
                     init_container_objs.append(client.V1Container(
@@ -870,17 +878,23 @@ class MCPServer:
                         volume_mounts=[client.V1VolumeMount(**vm) for vm in ic.get("volume_mounts", [])]
                     ))
 
+                # Build PodSpec
                 pod_spec = client.V1PodSpec(
                     containers=container_objs,
                     init_containers=init_container_objs or None,
                     volumes=[client.V1Volume(**v) for v in (volumes or [])],
-                    node_selector=node_selector
+                    node_selector=node_selector,
+                    tolerations=[client.V1Toleration(**t) for t in (tolerations or [])],
+                    affinity=client.V1Affinity(**affinity) if affinity else None,
+                    security_context=client.V1PodSecurityContext(**pod_security_context) if pod_security_context else None
                 )
 
+                # Labels
                 labels = {"app": name}
                 if pod_labels:
                     labels.update(pod_labels)
 
+                # Build Deployment
                 deployment = client.V1Deployment(
                     metadata=client.V1ObjectMeta(name=name),
                     spec=client.V1DeploymentSpec(
@@ -901,6 +915,7 @@ class MCPServer:
                 logger = logging.getLogger("create_deployment")
                 logger.error(f"Error creating deployment: {e}")
                 return {"success": False, "error": str(e)}
+
                 
 
         @self.server.tool()
@@ -1093,6 +1108,82 @@ class MCPServer:
                 import logging
                 logging.getLogger("create_pvc").error(str(e))
                 return {"success": False, "error": str(e)}
+        @self.server.tool()
+        def migrate_gke_node_pool_workloads(
+            source_node_pool: str,
+            dry_run: bool = False
+        ) -> Dict[str, Any]:
+            """
+            Migrate workloads from a GKE node pool by cordoning and draining its nodes.
+            Does NOT resize node pools.
+            """
+            try:
+                from kubernetes import client, config
+                config.load_kube_config()
+                core_v1 = client.CoreV1Api()
+
+                # Step 1: Find nodes in the source node pool
+                label_selector = f"cloud.google.com/gke-nodepool={source_node_pool}"
+                nodes = core_v1.list_node(label_selector=label_selector).items
+                if not nodes:
+                    return {"success": False, "message": f"No nodes found in node pool '{source_node_pool}'"}
+
+                node_names = [node.metadata.name for node in nodes]
+
+                if dry_run:
+                    return {
+                        "success": True,
+                        "dry_run": True,
+                        "message": f"Would cordon and drain nodes: {node_names}"
+                    }
+
+                # Step 2: Cordon and drain
+                drained_pods = {}
+                for node_name in node_names:
+                    core_v1.patch_node(node_name, {"spec": {"unschedulable": True}})
+                    pods = core_v1.list_pod_for_all_namespaces(field_selector=f"spec.nodeName={node_name}").items
+
+                    evicted = []
+                    for pod in pods:
+                        if pod.metadata.owner_references:
+                            if any(owner.kind == "DaemonSet" for owner in pod.metadata.owner_references):
+                                continue  # Skip DaemonSet pods
+
+                        eviction = client.V1Eviction(
+                            metadata=client.V1ObjectMeta(name=pod.metadata.name, namespace=pod.metadata.namespace),
+                            delete_options=client.V1DeleteOptions(grace_period_seconds=30)
+                        )
+                        try:
+                            core_v1.create_namespaced_pod_eviction(
+                                name=pod.metadata.name,
+                                namespace=pod.metadata.namespace,
+                                body=eviction
+                            )
+                            evicted.append(f"{pod.metadata.namespace}/{pod.metadata.name}")
+                        except Exception as e:
+                            # Force delete if eviction fails
+                            core_v1.delete_namespaced_pod(
+                                name=pod.metadata.name,
+                                namespace=pod.metadata.namespace,
+                                grace_period_seconds=30
+                            )
+                            evicted.append(f"{pod.metadata.namespace}/{pod.metadata.name} (forced)")
+
+                    drained_pods[node_name] = evicted
+
+                return {
+                    "success": True,
+                    "message": f"Nodes from node pool '{source_node_pool}' cordoned and drained",
+                    "nodes": node_names,
+                    "drained_pods": drained_pods
+                }
+
+            except Exception as e:
+                import logging
+                logger = logging.getLogger("migrate_gke_node_pool_workloads")
+                logger.error(f"Error migrating workloads: {e}")
+                return {"success": False, "error": str(e)}
+
 
     def _check_dependencies(self) -> bool:
         """Check for required command-line tools."""
